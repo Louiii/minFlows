@@ -14,10 +14,12 @@ import jax.random as jr
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import seaborn as sns
 from jax import Array
 from jynx import layers as nn
 from jynx.fit import TrainState, make_train_step
 from jynx.pytree import PyTree, static
+from matplotlib.animation import FuncAnimation
 from sklearn.datasets import make_moons
 from tqdm import tqdm
 
@@ -63,14 +65,14 @@ def heun_sampler(key, net, prior_sample, num_steps: int = 100, S_noise: float = 
     def step(x, aux):
         t, t_next, subkey = aux
         x = heun_step(net, x, t, t_next, S_noise, subkey)
-        return x, None
+        return x, x
 
     key, subkey = jr.split(key)
-    x, _ = jax.lax.scan(
+    x, path = jax.lax.scan(
         step, init=x, xs=(t_steps[:-2], t_steps[1:-1], jr.split(key, num_steps-1))
     )
     x = euler_step(net, x, t_steps[-2], t_steps[-1], S_noise, subkey)
-    return x
+    return x, jnp.concatenate([path, x[None]], axis=0)
 
 
 def fourier_embedding(x, freqs):
@@ -251,7 +253,7 @@ def dataloader(data, batch_size):
             batch = []
 
 
-def train_and_sample(network_output_space):
+def train_and_sample(network_output_space: NetworkImage, plot_net: bool) -> None:
     num_epochs = 3000
     batch_size = 512
     learning_rate = 3e-4
@@ -295,26 +297,86 @@ def train_and_sample(network_output_space):
     # --- Inference ---
     print("Generating new samples with the trained model...")
     prior_samples = jr.normal(jr.key(0), (n_samples, 2))
-    model_samples = np.array(
-        heun_sampler(jr.key(0), state.params, prior_samples, num_steps=sampler_steps, S_noise=S_noise)
+    model_samples, path = heun_sampler(
+        jr.key(0), state.params, prior_samples, num_steps=sampler_steps, S_noise=S_noise
     )
 
     # --- Visualise ---
     plt.style.use('seaborn-v0_8-whitegrid')
     fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     ax.scatter(*moons.T, c='blue', s=10, alpha=0.5, label="Original Data")
-    ax.scatter(*model_samples.T, c='red', s=10, alpha=0.5, label="Generated Samples")
+    ax.scatter(*np.array(model_samples).T, c='red', s=10, alpha=0.5, label="Generated Samples")
     ax.set_title(f"Predicting {network_output_space.name}.")
     ax.legend()
     ax.set_aspect('equal', adjustable='box')
     plt.savefig(PLOTDIR / network_output_space.name)
     plt.close(fig)
 
+    if plot_net:
+        path = np.array(path)
+        net = state.params
+        ts = net.time_steps(path.shape[0], device=model_samples.device)[:-1]
+        num = 32
+        xs = np.linspace(np.percentile(path[..., 0], 3), np.percentile(path[..., 0], 97), num)
+        ys = np.linspace(np.percentile(path[..., 1], 3), np.percentile(path[..., 1], 97), num)
+        x = np.stack(np.meshgrid(xs, ys), axis=-1)
+        field = np.array(jax.lax.map(lambda t: jax.vmap(net.direction, (0, None))(x, t), ts))
+
+        print("Animating...")
+        plt.style.use('seaborn-v0_8-darkgrid')
+        fig, ax = plt.subplots(figsize=(10, 8))
+        plt.subplots_adjust(0, 0, 1, 1, 0, 0)
+        cmap = sns.color_palette("rocket", as_cmap=True)
+
+        def update(frame):
+            """
+            This function is called for each frame of the animation.
+            It clears the previous frame and draws the new one.
+            """
+            ax.clear()
+            if frame >= ts.shape[0]:
+                frame = -1
+
+            # Get data for the current time step
+            u = field[frame, :, :, 0]
+            v = field[frame, :, :, 1]
+            current_path = path[frame, :, :]
+            current_time = ts[frame]
+
+            # Calculate the magnitude of the vectors
+            magnitude = np.sqrt(u**2 + v**2)
+
+            # Plotting the vector field
+            ax.quiver(x[:, :, 0], x[:, :, 1], u, v, magnitude, cmap=cmap, alpha=0.8, scale=50)
+
+            # Plotting the particle paths
+            ax.scatter(current_path[:, 0], current_path[:, 1], s=5, color="#960DFE", alpha=0.8, edgecolors='w', linewidth=0.5)
+
+            ax.set_facecolor('#1C1C1E')
+            ax.set_title(f'Vector Field and Particle Paths\nTime: {current_time:.2f}s', fontsize=16, color='white')
+            ax.set_xlabel('X-coordinate', fontsize=12, color='white')
+            ax.set_ylabel('Y-coordinate', fontsize=12, color='white')
+            ax.set_xlim(np.min(x[:,:,0]), np.max(x[:,:,0]))
+            ax.set_ylim(np.min(x[:,:,1]), np.max(x[:,:,1]))
+            ax.tick_params(axis='x', colors='white')
+            ax.tick_params(axis='y', colors='white')
+            ax.grid(True, which='both', linestyle='--', linewidth=0.5, color='#555555')
+
+        ani = FuncAnimation(fig, update, frames=np.arange(len(ts) + 10), interval=50, blit=False)
+        ani.save(
+            PLOTDIR / f'{network_output_space.name}.mp4',
+            writer="imagemagick",
+            fps=15,
+        )
+        plt.close(fig)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train simple generative models")
     parser.add_argument("--network_output", type=str, help="The output type of the network.")
-    train_and_sample(NetworkImage.__members__[parser.parse_args().network_output])
+    parser.add_argument("--plot_net", action="store_true", help="Shift the directory up by one.")
+    args = parser.parse_args()
+    train_and_sample(NetworkImage.__members__[args.network_output], plot_net=args.plot_net)
 
 
 if __name__ == "__main__":
